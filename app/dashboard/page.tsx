@@ -11,7 +11,12 @@ export default async function Dashboard() {
           return <RedirectComponent to={authCheck.redirectTo} />
         }
 
-        return <DashboardContent />
+        return (
+          <>
+            <div className="min-h-screen flex items-center justify-center text-3xl">dashboard content - visible (subscription active)</div>
+            <DashboardContent />
+          </>
+        )
       } catch (error) {
         console.error('Error in Dashboard page:', error)
         return <RedirectComponent to="/" />

@@ -1,0 +1,1334 @@
+================================================================================
+                    SECURITY TUTORIAL FOR STUDENTS
+                    SaaS Stripe Starter Application
+================================================================================
+
+This document explains the security measures implemented in our application,
+with practical examples you can test using Postman.
+
+================================================================================
+0) FIRST STEPS WITH POSTMAN FOR API TESTING
+================================================================================
+
+SETUP YOUR POSTMAN ENVIRONMENT:
+
+1. Download and install Postman from https://www.postman.com/downloads/
+
+2. Create a new Collection called "SaaS Security Testing"
+
+3. Set up environment variables in Postman:
+   // In Postman, go to the gear icon (top right) > "Environments" > "Add":
+   //  - Add a new environment called "SaaS Local"
+   //  - Add variable: BASE_URL   Initial Value: http://localhost:3000
+   //  - Add variable: AUTH_TOKEN Initial Value: (paste your session token here after login)
+   //  - Click "Save", then select the environment in the top-right dropdown
+
+   - BASE_URL: http://localhost:3000 (your local dev server)
+   - AUTH_TOKEN: (you'll get this from your browser after logging in)
+
+4. How to get your AUTH_TOKEN:
+   a) Start your application: npm run dev
+   b) Open browser and go to http://localhost:3000
+   c) Log in with Clerk authentication
+   d) Open Developer Tools (F12)
+   e) Go to "Application" tab -> "Cookies"
+   f) Copy the value of the "__session" cookie
+   g) In Postman, set Authorization header:
+      Key: Cookie
+      Value: __session=YOUR_TOKEN_HERE
+
+5. Create your first request:
+   - Method: GET
+   - URL: {{BASE_URL}}/api/test-records
+   - This will list all your test records
+
+================================================================================
+1) OUR CURRENT SECURITY ARCHITECTURE (SIMPLE EXPLANATION)
+================================================================================
+
+OVERVIEW:
+Our application uses a "Server-Side First" security approach with multiple
+layers of protection. Think of it like a bank vault with several locked doors.
+
+LAYER 1: AUTHENTICATION (Clerk)
+-------------------------------
+What it does: Verifies WHO you are
+How it works: Clerk provides user authentication - login/signup functionality
+In our code: Every API route checks `await auth()` to verify the user
+Example: app/api/test-records/route.ts:10
+         if (!userId) { throw new ApiError(401, 'Unauthorized') }
+
+ANALOGY: Like showing your ID card at the bank entrance
+
+
+LAYER 2: AUTHORIZATION (User ID Verification)
+----------------------------------------------
+What it does: Verifies WHAT you can access
+How it works: We check that users can only access their OWN data
+In our code: Prisma queries always include `where: { userId }`
+Example: app/api/test-records/[id]/route.ts:29-34
+         const record = await prisma.recordTest.findFirst({
+           where: { id, userId } // Critical: ensures user owns this record
+         })
+
+ANALOGY: Like the bank checking you can only access YOUR account, not others
+
+
+LAYER 3: DATABASE SECURITY (Prisma ORM)
+----------------------------------------
+What it does: Prevents SQL injection attacks
+How it works: Prisma uses parameterized queries - it NEVER directly inserts
+              user input into SQL queries
+
+Example of SQL INJECTION (what we PREVENT):
+❌ BAD (vulnerable):
+   SQL = "SELECT * FROM records WHERE id = '" + userInput + "'"
+   If userInput = "1' OR '1'='1", it returns ALL records!
+
+✅ GOOD (what Prisma does):
+   prisma.recordTest.findFirst({ where: { id: userInput } })
+   Prisma safely escapes the input, preventing injection
+
+ANALOGY: Like the bank using secure communication channels that can't be
+         tampered with
+
+
+LAYER 4: RATE LIMITING (Request Throttling)
+--------------------------------------------
+What it does: Prevents abuse by limiting requests per user
+How it works: LRU Cache tracks requests per user/IP
+              - Allows 20 requests per minute per user
+              - Tracks up to 500 unique users
+              - Forgets old data after 60 seconds
+
+In our code: lib/rate-limit.ts
+Example: app/api/test-records/route.ts:17-22
+         const { success, remaining } = await apiLimiter.check(20, identifier)
+         if (!success) { throw new ApiError(429, 'Rate limit exceeded') }
+
+ANALOGY: Like the bank limiting you to 20 transactions per minute to prevent
+         suspicious activity
+
+
+LAYER 5: CONTENT-TYPE VALIDATION
+---------------------------------
+What it does: Ensures requests send data in the expected format (JSON)
+How it works: Checks the Content-Type header before processing the request
+In our code: lib/rate-limit.ts:70-79
+Example: app/api/test-records/route.ts:48-50
+         if (!validateContentType(req, 'application/json')) {
+           throw new ApiError(415, 'Content-Type must be application/json')
+         }
+
+ANALOGY: Like the bank requiring you to fill out forms in English, not
+         accepting forms in random formats
+
+
+LAYER 6: INPUT VALIDATION
+--------------------------
+What it does: Checks that data is the correct type and format
+How it works: Validates request body fields before database operations
+Example: app/api/test-records/route.ts:63-65
+         if (!title || typeof title !== 'string') {
+           throw new ApiError(400, 'Title is required and must be a string')
+         }
+
+ANALOGY: Like the bank checking your deposit slip has a valid amount
+
+
+================================================================================
+2) DATABASE CONNECTION: PRISMA vs SUPABASE CLIENT (RLS Explained)
+================================================================================
+
+UNDERSTANDING RLS (ROW LEVEL SECURITY):
+---------------------------------------
+
+RLS is a PostgreSQL feature that enforces security rules AT THE DATABASE LEVEL.
+Think of it like a security guard at the database door.
+
+OUR ARCHITECTURE:
+
+┌─────────────────────────────────────────────────────────────┐
+│  CLIENT (Browser)                                            │
+│  ❌ Should NEVER use: SUPABASE_ANON_KEY                     │
+│  ❌ Should NEVER use: SUPABASE_SERVICE_ROLE_KEY             │
+└─────────────────────────────────────────────────────────────┘
+                         │
+                         │ API calls through Next.js routes
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│  SERVER (Next.js API Routes)                                 │
+│  ✅ Uses: Clerk Authentication                               │
+│  ✅ Uses: Prisma ORM with DATABASE_URL                       │
+│  ✅ Security: Controlled in our code (userId checks)         │
+└─────────────────────────────────────────────────────────────┘
+                         │
+                         │ Prisma queries
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│  DATABASE (Supabase PostgreSQL)                              │
+│  Connected via: DATABASE_URL (superuser connection)          │
+│  RLS Status: OFF (because we control security in our code)  │
+└─────────────────────────────────────────────────────────────┘
+
+WHY RLS IS OFF IN OUR CASE:
+---------------------------
+
+The DATABASE_URL contains a "superuser" connection that BYPASSES RLS.
+This is CORRECT for our architecture because:
+
+1. We control security in our API routes (server-side)
+2. Clients NEVER directly access the database
+3. All requests go through Next.js API routes first
+4. We manually check `userId` in every query
+
+ENVIRONMENT VARIABLES EXPLAINED:
+--------------------------------
+
+DATABASE_URL:
+  - Used by: Prisma ORM (server-side only)
+  - Type: Superuser connection
+  - Bypasses: RLS (Row Level Security)
+  - Security: Controlled in application code
+  - Example: postgresql://postgres:[PASSWORD]@db.xxx.supabase.co:5432/postgres
+
+DIRECT_URL:
+  - Used by: Prisma Migrations (not at runtime)
+  - Type: Direct connection (bypasses connection pooling)
+  - Purpose: Running database migrations
+
+SUPABASE_ANON_KEY (we DON'T use this):
+  - Would be used: For client-side Supabase SDK
+  - Type: Public, safe to expose
+  - Requires: RLS must be ON for security
+  - We avoid this: Because we use server-side Prisma instead
+
+SUPABASE_SERVICE_ROLE_KEY (we DON'T use this):
+  - Would be used: For admin operations bypassing RLS
+  - Type: SECRET - must NEVER be exposed to client
+  - Bypasses: RLS completely
+  - We avoid this: We use Prisma with DATABASE_URL instead
+
+
+WHEN WOULD YOU NEED RLS ON?
+---------------------------
+
+Scenario 1: Client-Side Database Access (NOT our approach)
+❌ Client Code:
+   const { data } = await supabase
+     .from('records')
+     .select('*')
+   // WITHOUT RLS: User could modify the query to see ALL records!
+   // WITH RLS: Database blocks access to records not owned by user
+
+Scenario 2: Server-Side with Manual Security (OUR approach)
+✅ Server Code:
+   const records = await prisma.recordTest.findMany({
+     where: { userId }  // We manually filter by userId
+   })
+   // RLS: OFF (not needed, we control security in code)
+   // Security: Enforced by our API route logic
+
+
+PRACTICAL POSTMAN TEST: Understanding Our Security
+--------------------------------------------------
+
+Test 1: Try to access someone else's record
+   Method: GET
+   URL: {{BASE_URL}}/api/test-records/SOME_OTHER_USER_RECORD_ID
+   Expected Result: 404 Not Found (our code blocks access)
+
+   What's happening: Our code checks `where: { id, userId }`
+   Even though RLS is OFF, our application code enforces security
+
+Test 2: Verify authentication is required
+   Method: GET
+   URL: {{BASE_URL}}/api/test-records
+   Headers: Remove the Cookie/Authorization header
+   Expected Result: 401 Unauthorized
+
+   What's happening: Clerk auth() returns null, we throw error
+
+
+KEY TAKEAWAY:
+------------
+RLS OFF is SAFE in our architecture because:
+1. Clients never directly access the database
+2. All requests go through our secured API routes
+3. We manually enforce userId checks in every query
+4. Prisma prevents SQL injection attacks
+
+RLS ON would be REQUIRED if:
+1. You use Supabase client SDK from the browser
+2. You expose database access to the frontend
+3. You use SUPABASE_ANON_KEY in client code
+
+
+================================================================================
+3) CONTENT-TYPE VALIDATION TESTING
+================================================================================
+
+WHAT IS CONTENT-TYPE?
+--------------------
+Content-Type is an HTTP header that tells the server what format the data is in.
+Think of it like telling someone "I'm speaking English" before talking to them.
+
+Common Content-Types:
+- application/json (what we expect)
+- text/plain (plain text)
+- text/html (HTML)
+- application/xml (XML data)
+
+WHY VALIDATE IT?
+---------------
+If we don't check Content-Type, attackers could:
+1. Send malformed data that crashes our parser
+2. Bypass input validation
+3. Cause unexpected behavior in our application
+
+
+POSTMAN TEST 1: Valid Request (Should Succeed)
+----------------------------------------------
+Method: POST
+URL: {{BASE_URL}}/api/test-records
+Headers:
+  Content-Type: application/json
+  Cookie: __session=YOUR_TOKEN
+Body (raw JSON):
+  {
+    "title": "Valid Test Record",
+    "description": "This should work",
+    "status": "active"
+  }
+
+Expected Result: 201 Created
+Response: Your newly created record with an ID
+
+What happened: ✅ Content-Type matches, request processed
+
+
+POSTMAN TEST 2: Wrong Content-Type (Should Fail)
+------------------------------------------------
+Method: POST
+URL: {{BASE_URL}}/api/test-records
+Headers:
+  Content-Type: text/plain
+  Cookie: __session=YOUR_TOKEN
+Body (raw Text):
+  {
+    "title": "Invalid Test Record",
+    "description": "This should fail"
+  }
+
+Expected Result: 415 Unsupported Media Type
+Response:
+  {
+    "error": "Content-Type must be application/json"
+  }
+
+What happened: ❌ Content-Type doesn't match, our validation blocks it
+
+
+POSTMAN TEST 3: Missing Content-Type (Should Fail)
+--------------------------------------------------
+Method: PUT
+URL: {{BASE_URL}}/api/test-records/SOME_RECORD_ID
+Headers:
+  Cookie: __session=YOUR_TOKEN
+  (Remove Content-Type header entirely)
+Body (raw JSON):
+  {
+    "title": "Updated Title"
+  }
+
+Expected Result: 415 Unsupported Media Type
+Response:
+  {
+    "error": "Content-Type must be application/json"
+  }
+
+What happened: ❌ No Content-Type header, our validation blocks it
+
+
+CODE EXPLANATION:
+----------------
+Location: lib/rate-limit.ts:70-79
+
+export function validateContentType(req: NextRequest, expectedType: string): boolean {
+  const contentType = req.headers.get('content-type')
+
+  if (!contentType) {
+    return false  // No Content-Type header = reject
+  }
+
+  // Content-Type can include charset (e.g., "application/json; charset=utf-8")
+  // So we check if it STARTS WITH the expected type
+  return contentType.toLowerCase().startsWith(expectedType.toLowerCase())
+}
+
+WHERE WE USE IT:
+- POST /api/test-records (line 48)
+- PUT /api/test-records/[id] (line 62)
+
+We DON'T check it on GET/DELETE because they don't have request bodies.
+
+
+SECURITY IMPACT:
+---------------
+Severity: LOW (but good practice)
+Why it matters: Prevents malformed requests from reaching our JSON parser
+Real-world scenario: An attacker might try to send XML or HTML that could
+                     confuse the parser or exploit vulnerabilities
+
+
+================================================================================
+4) RATE LIMITING TESTING
+================================================================================
+
+WHAT IS RATE LIMITING?
+----------------------
+Rate limiting restricts how many requests a user can make in a time window.
+Think of it like a speed limit on a highway - prevents people from going too fast.
+
+OUR CONFIGURATION:
+- Limit: 20 requests per minute per user
+- Window: 60 seconds (1 minute)
+- Tracking: Up to 500 unique users
+- Identifier: userId (or IP address if not logged in)
+
+WHY DO WE NEED IT?
+-----------------
+Without rate limiting, an attacker (or buggy code) could:
+1. Overload our database with thousands of queries per second
+2. Rack up huge bills (database costs, serverless function costs)
+3. Make the app slow or unavailable for legitimate users (DoS attack)
+4. Scrape all our data by making unlimited GET requests
+
+
+POSTMAN TEST 1: Normal Usage (Should Succeed)
+---------------------------------------------
+Method: GET
+URL: {{BASE_URL}}/api/test-records
+Headers:
+  Cookie: __session=YOUR_TOKEN
+
+Step 1: Send the request
+Expected Result: 200 OK
+Response Headers: Look for X-RateLimit-Remaining
+  X-RateLimit-Remaining: 19 (you have 19 requests left)
+
+What happened: ✅ First request succeeds, 19 remaining
+
+
+POSTMAN TEST 2: Hitting the Rate Limit (Should Fail)
+----------------------------------------------------
+Now let's trigger the rate limit by sending many requests quickly!
+
+Method: GET
+URL: {{BASE_URL}}/api/test-records
+Headers:
+  Cookie: __session=YOUR_TOKEN
+
+Step 1: Use Postman's Collection Runner
+  a) Right-click your request -> "Add to Collection"
+  b) Click "Runner" button (top left)
+  c) Select your collection
+  d) Set Iterations: 25 (more than our limit of 20)
+  e) Set Delay: 0ms (send as fast as possible)
+  f) Click "Run"
+
+Step 2: Observe the results
+First 20 requests: 200 OK (with decreasing X-RateLimit-Remaining)
+  Request 1:  X-RateLimit-Remaining: 19
+  Request 2:  X-RateLimit-Remaining: 18
+  ...
+  Request 20: X-RateLimit-Remaining: 0
+
+Requests 21-25: 429 Too Many Requests
+  Response:
+  {
+    "error": "Rate limit exceeded. Please try again later."
+  }
+
+What happened: ❌ After 20 requests, our rate limiter blocks further requests
+
+
+POSTMAN TEST 3: Rate Limit Recovery (Should Succeed After Waiting)
+------------------------------------------------------------------
+Method: GET
+URL: {{BASE_URL}}/api/test-records
+Headers:
+  Cookie: __session=YOUR_TOKEN
+
+Step 1: Wait 60 seconds after hitting the rate limit
+Step 2: Send the request again
+Expected Result: 200 OK
+  X-RateLimit-Remaining: 19
+
+What happened: ✅ After 60 seconds, the rate limit resets
+
+
+MANUAL TESTING ALTERNATIVE:
+---------------------------
+If you don't want to use Collection Runner, you can manually test:
+
+1. Send 20 requests quickly (copy-paste or use keyboard shortcut)
+2. Watch the X-RateLimit-Remaining header decrease
+3. On the 21st request, you'll get 429 error
+4. Wait 60 seconds and try again - it works!
+
+
+CODE EXPLANATION:
+----------------
+Location: lib/rate-limit.ts:13-46
+
+How it works:
+1. Each request stores a timestamp in the LRU cache
+2. We check how many timestamps exist within the last 60 seconds
+3. If >= 20, reject the request
+4. If < 20, allow the request and add a new timestamp
+
+The LRU Cache (Least Recently Used):
+- Tracks up to 500 unique users
+- Automatically forgets old data after 60 seconds (TTL = Time To Live)
+- Like a notebook with 500 pages - when full, oldest page gets removed
+
+Example for user "user:abc123":
+  Minute 1: [timestamp1, timestamp2, ..., timestamp20] ✅ All allowed
+  Minute 1: [timestamp21] ❌ BLOCKED (21 > 20)
+  Minute 2: Cache cleared, starts fresh
+
+
+WHERE WE USE IT:
+- GET /api/test-records (line 17-22)
+- POST /api/test-records (line 53-58)
+- GET /api/test-records/[id] (line 20-25)
+- PUT /api/test-records/[id] (line 67-72)
+- DELETE /api/test-records/[id] (line 118-123)
+
+Every single endpoint checks rate limiting BEFORE processing the request.
+
+
+REAL-WORLD SCENARIOS:
+--------------------
+
+Scenario 1: Accidental DoS (Denial of Service)
+A developer writes buggy frontend code with an infinite loop:
+  while (true) {
+    fetch('/api/test-records')
+  }
+Without rate limiting: App crashes, database overloads, huge bills
+With rate limiting: After 20 requests, further requests are blocked
+
+Scenario 2: Malicious Attack
+An attacker tries to scrape all user data:
+  for (let i = 0; i < 10000; i++) {
+    fetch(`/api/test-records/${i}`)
+  }
+Without rate limiting: Attacker gets all data
+With rate limiting: Only gets 20 records, then blocked
+
+Scenario 3: Credential Stuffing
+An attacker tries to guess passwords by making thousands of login attempts.
+Rate limiting blocks them after a few tries.
+
+
+ADVANCED CONSIDERATIONS:
+-----------------------
+
+Our current implementation tracks by:
+1. userId (if logged in)
+2. IP address (if not logged in)
+
+Location: lib/rate-limit.ts:56-67
+  export function getRateLimitIdentifier(req: NextRequest, userId?: string): string {
+    if (userId) {
+      return `user:${userId}`
+    }
+
+    const ip = req.headers.get('x-forwarded-for') ||
+               req.headers.get('x-real-ip') ||
+               'unknown'
+
+    return `ip:${ip}`
+  }
+
+Why IP as fallback?
+- Some endpoints might not require authentication
+- Prevents attackers from making unlimited requests without logging in
+
+Limitations:
+- IP-based rate limiting can affect users behind shared IPs (offices, schools)
+- Solution: Use more sophisticated algorithms (Redis, Upstash Ratelimit)
+
+
+SECURITY IMPACT:
+---------------
+Severity: MEDIUM-HIGH
+Why it matters: Prevents DoS attacks, reduces costs, ensures fair usage
+Real-world scenario: Without rate limiting, a single attacker could make your
+                     app unusable and generate huge AWS/Supabase bills
+
+
+================================================================================
+5) LRU CACHE EXPLANATION (How Rate Limiting Works Under the Hood)
+================================================================================
+
+WHAT IS LRU CACHE?
+-----------------
+LRU = Least Recently Used
+It's a data structure that stores items with automatic eviction (removal).
+
+ANALOGY: A notebook with limited pages
+- You have a notebook with exactly 500 pages (our limit)
+- Each page is for one user
+- When you write on a page, it moves to the front
+- After 60 seconds, the page disappears (TTL = Time To Live)
+- If you need a 501st page, the oldest page gets thrown away
+
+
+OUR CONFIGURATION:
+-----------------
+Location: lib/rate-limit.ts:50-53
+
+export const apiLimiter = rateLimit({
+  interval: 60 * 1000,        // 60 seconds = 1 minute
+  uniqueTokenPerInterval: 500 // Track up to 500 users
+})
+
+What this means:
+- interval: 60,000ms = How long we remember each user's requests
+- uniqueTokenPerInterval: 500 = Maximum number of users we track simultaneously
+
+
+HOW IT WORKS: STEP BY STEP
+--------------------------
+
+Let's say Alice makes requests to our API:
+
+Time: 0s
+Alice makes request #1
+Cache: { "user:alice": [timestamp_0] }
+Remaining: 19 requests
+
+Time: 1s
+Alice makes request #2
+Cache: { "user:alice": [timestamp_0, timestamp_1] }
+Remaining: 18 requests
+
+Time: 5s
+Alice makes request #20
+Cache: { "user:alice": [timestamp_0, ..., timestamp_19] }
+Remaining: 0 requests
+
+Time: 6s
+Alice makes request #21
+Check: validTimestamps.length = 20 >= limit (20)
+Result: ❌ BLOCKED - Rate limit exceeded
+Remaining: 0 requests
+
+Time: 61s (after 60 seconds)
+Alice makes request #22
+Check: All old timestamps (older than 60s) are filtered out
+Cache: { "user:alice": [timestamp_61] }
+Result: ✅ ALLOWED - Rate limit reset
+Remaining: 19 requests
+
+
+CODE WALKTHROUGH:
+----------------
+Location: lib/rate-limit.ts:20-44
+
+check: async (limit: number, token: string) => {
+  // Step 1: Get existing timestamps for this user (or empty array)
+  const tokenCount = tokenCache.get(token) || [0]
+
+  // Step 2: Get current time
+  const currentTime = Date.now()  // e.g., 1700000000000 (milliseconds since 1970)
+
+  // Step 3: Filter out old timestamps (outside the 60-second window)
+  const validTimestamps = tokenCount.filter(
+    timestamp => currentTime - timestamp < options.interval
+  )
+
+  // Step 4: Check if we've exceeded the limit
+  if (validTimestamps.length >= limit) {
+    return {
+      success: false,  // BLOCKED
+      remaining: 0
+    }
+  }
+
+  // Step 5: Allow the request - add current timestamp
+  validTimestamps.push(currentTime)
+  tokenCache.set(token, validTimestamps)
+
+  return {
+    success: true,   // ALLOWED
+    remaining: limit - validTimestamps.length
+  }
+}
+
+
+WHY 500 USERS? WHY 60 SECONDS?
+------------------------------
+
+uniqueTokenPerInterval: 500
+- This is the maximum number of DIFFERENT users we track at once
+- If 501 users make requests, the least recently used one gets removed
+- For most apps, 500 concurrent users is reasonable
+- Each user entry is small (just an array of timestamps)
+- Adjust based on your app's scale:
+  * Small app: 100-500 users
+  * Medium app: 1000-5000 users
+  * Large app: 10000+ users (consider Redis instead)
+
+interval: 60 * 1000 (60 seconds)
+- This is the "sliding window" for rate limiting
+- After 60 seconds, old requests are forgotten
+- Shorter interval = stricter rate limiting
+- Longer interval = more lenient rate limiting
+- Common values:
+  * 1 minute: General API endpoints
+  * 5 minutes: Login attempts
+  * 1 hour: Resource-intensive operations
+  * 1 day: Email sending
+
+
+VISUAL EXAMPLE: The Cache Over Time
+-----------------------------------
+
+Initial state:
+LRU Cache (0/500 users): []
+
+Alice makes 5 requests:
+LRU Cache (1/500 users): {
+  "user:alice": [ts1, ts2, ts3, ts4, ts5]
+}
+
+Bob makes 3 requests:
+LRU Cache (2/500 users): {
+  "user:alice": [ts1, ts2, ts3, ts4, ts5],
+  "user:bob": [ts6, ts7, ts8]
+}
+
+60 seconds pass, then Alice makes another request:
+LRU Cache (2/500 users): {
+  "user:alice": [ts_new],  // Old timestamps filtered out
+  "user:bob": [ts6, ts7, ts8]
+}
+
+Another 60 seconds pass:
+LRU Cache (0/500 users): {}  // Both users' data expired (TTL)
+
+
+WHAT IF WE HIT 500 USERS?
+-------------------------
+
+Scenario: 500 users are actively making requests, then user #501 arrives
+
+Current cache (FULL):
+{
+  "user:user1": [timestamps...],
+  "user:user2": [timestamps...],
+  ...
+  "user:user500": [timestamps...]
+}
+
+User #501 makes a request:
+- LRU Cache automatically removes the LEAST RECENTLY USED entry
+- Let's say "user:user1" hasn't made a request in 30 seconds
+- "user:user1" gets evicted to make room
+- "user:user501" gets added
+
+New cache (still 500 users):
+{
+  "user:user2": [timestamps...],
+  ...
+  "user:user500": [timestamps...],
+  "user:user501": [timestamps...]  // New entry
+}
+
+If "user:user1" makes another request later, they start fresh with a new entry.
+
+
+MEMORY CONSIDERATIONS:
+---------------------
+
+Each cache entry stores:
+- Key: string (e.g., "user:abc123") ≈ 20-50 bytes
+- Value: array of timestamps (max 20 timestamps × 8 bytes each) = 160 bytes
+- Total per user: ≈ 200-250 bytes
+
+For 500 users:
+500 users × 250 bytes = 125 KB (very small!)
+
+This is why LRU cache is efficient for rate limiting:
+- Low memory usage
+- Fast lookups (O(1))
+- Automatic cleanup (TTL)
+
+
+ALTERNATIVES TO LRU CACHE:
+--------------------------
+
+For small/medium apps (like ours):
+✅ LRU Cache (in-memory)
+  Pros: Fast, simple, no external dependencies
+  Cons: Resets when server restarts, doesn't work with multiple servers
+
+For large-scale apps:
+✅ Redis (external cache)
+  Pros: Persistent, works with multiple servers, supports distributed apps
+  Cons: Requires external service, adds complexity
+  Example: Upstash Ratelimit, Redis with @upstash/redis
+
+✅ Database-based rate limiting
+  Pros: Persistent, works with multiple servers
+  Cons: Slower (database queries), more complex
+  Example: Store timestamps in PostgreSQL
+
+
+PRACTICAL POSTMAN DEMONSTRATION:
+--------------------------------
+
+Test 1: Show remaining requests decreasing
+1. Make request → Check header: X-RateLimit-Remaining: 19
+2. Make request → Check header: X-RateLimit-Remaining: 18
+3. Make request → Check header: X-RateLimit-Remaining: 17
+...
+20. Make request → Check header: X-RateLimit-Remaining: 0
+21. Make request → 429 Rate Limit Exceeded
+
+This demonstrates the LRU cache tracking your requests in real-time!
+
+Test 2: Show TTL (Time To Live) expiration
+1. Hit the rate limit (21 requests)
+2. Wait 60 seconds
+3. Make another request → Works! X-RateLimit-Remaining: 19
+
+This demonstrates the cache forgetting old timestamps after 60 seconds!
+
+
+SECURITY IMPACT:
+---------------
+The LRU cache is the ENGINE that powers our rate limiting:
+- Efficient: Low memory, fast lookups
+- Automatic: No manual cleanup needed (TTL handles it)
+- Fair: Each user gets their own limit
+- Scalable: Can adjust limits based on user tier (free vs paid)
+
+
+KEY TAKEAWAYS:
+-------------
+1. LRU Cache = Limited-size storage with automatic eviction
+2. We track 500 users simultaneously
+3. We remember each user's requests for 60 seconds
+4. After 20 requests in 60 seconds, user is blocked
+5. After 60 seconds, the limit resets automatically
+6. Low memory usage (≈125 KB for 500 users)
+
+
+================================================================================
+6) AUTHENTICATION vs AUTHORIZATION (What's the Difference?)
+================================================================================
+
+AUTHENTICATION: WHO are you?
+---------------------------
+Verifying a user's identity (login)
+Example: Showing your passport at airport security
+
+In our app:
+- Clerk handles authentication
+- User logs in with email/password or OAuth (Google, GitHub)
+- Clerk gives us a userId
+- Code: const { userId } = await auth()
+
+Test in Postman:
+  Request without authentication → 401 Unauthorized
+  Request with valid token → 200 OK
+
+
+AUTHORIZATION: WHAT can you access?
+----------------------------------
+Determining what resources a user can access
+Example: Your boarding pass determines which flight you can board
+
+In our app:
+- We manually check userId in database queries
+- Users can only access their OWN records
+- Code: where: { id, userId }
+
+Test in Postman:
+  Try to access another user's record → 404 Not Found
+  Access your own record → 200 OK
+
+
+EXAMPLE: Alice tries to access Bob's record
+------------------------------------------
+
+1. Alice logs in (Authentication)
+   Result: ✅ Clerk returns userId: "alice123"
+
+2. Alice requests Bob's record: GET /api/test-records/bob_record_id
+   Our code checks:
+   ```
+   const record = await prisma.recordTest.findFirst({
+     where: {
+       id: "bob_record_id",
+       userId: "alice123"  // Authorization check
+     }
+   })
+   ```
+   Result: ❌ record is null (no match found)
+   Response: 404 Not Found
+
+3. Alice requests her own record: GET /api/test-records/alice_record_id
+   Our code checks:
+   ```
+   const record = await prisma.recordTest.findFirst({
+     where: {
+       id: "alice_record_id",
+       userId: "alice123"  // Authorization check passes
+     }
+   })
+   ```
+   Result: ✅ record found
+   Response: 200 OK with record data
+
+
+WHY BOTH ARE IMPORTANT:
+----------------------
+Authentication alone is NOT enough!
+
+Imagine a system with ONLY authentication:
+- Alice logs in ✅
+- Alice requests: GET /api/test-records/bob_record_id
+- Without authorization check: ✅ Returns Bob's data
+- Result: SECURITY BREACH! Alice can access Bob's private data
+
+Our system with BOTH:
+- Alice logs in ✅ (Authentication)
+- Alice requests: GET /api/test-records/bob_record_id
+- Our code checks userId ❌ (Authorization)
+- Result: 404 Not Found - Security maintained!
+
+
+POSTMAN TEST: Authorization Bypass Attempt
+------------------------------------------
+
+Step 1: Create a record as yourself
+  Method: POST
+  URL: {{BASE_URL}}/api/test-records
+  Body: { "title": "My Secret Record" }
+  Result: 201 Created
+  Response: { "id": "abc123", "userId": "your_user_id", ... }
+
+Step 2: Try to access it with a different user's token (if you have one)
+  Method: GET
+  URL: {{BASE_URL}}/api/test-records/abc123
+  Headers: Cookie: __session=DIFFERENT_USER_TOKEN
+  Result: 404 Not Found
+
+  What happened: Even though the record exists, the different userId
+                 doesn't match, so our authorization blocks access
+
+
+================================================================================
+7) COMMON SECURITY VULNERABILITIES (What We're Protecting Against)
+================================================================================
+
+VULNERABILITY 1: SQL Injection
+------------------------------
+What it is: Attacker inserts malicious SQL code through user input
+
+Example of vulnerable code (WE DON'T DO THIS):
+  const userId = userInput  // e.g., "1 OR 1=1"
+  const query = `SELECT * FROM records WHERE userId = ${userId}`
+  // Results in: SELECT * FROM records WHERE userId = 1 OR 1=1
+  // This returns ALL records! (1=1 is always true)
+
+How we prevent it:
+  ✅ We use Prisma ORM
+  ✅ Prisma automatically escapes user input
+  ✅ We never write raw SQL queries with user input
+
+Test in Postman: You CAN'T exploit this in our app!
+  Method: GET
+  URL: {{BASE_URL}}/api/test-records/abc123' OR '1'='1
+  Result: 404 Not Found (Prisma safely handles the input)
+
+
+VULNERABILITY 2: Broken Authorization
+-------------------------------------
+What it is: Users can access resources they shouldn't
+
+Example of vulnerable code (WE DON'T DO THIS):
+  const record = await prisma.recordTest.findFirst({
+    where: { id }  // Missing userId check!
+  })
+  // Any logged-in user can access ANY record!
+
+How we prevent it:
+  ✅ We ALWAYS include userId in database queries
+  ✅ Code: where: { id, userId }
+
+Test in Postman:
+  Method: GET
+  URL: {{BASE_URL}}/api/test-records/SOME_OTHER_USER_RECORD_ID
+  Result: 404 Not Found (our authorization blocks it)
+
+
+VULNERABILITY 3: Denial of Service (DoS)
+----------------------------------------
+What it is: Attacker overwhelms the server with requests, making it unavailable
+
+Example attack (WE PREVENT THIS):
+  for (let i = 0; i < 1000000; i++) {
+    fetch('/api/test-records')
+  }
+
+How we prevent it:
+  ✅ Rate limiting (20 requests per minute)
+  ✅ LRU cache tracks request counts
+
+Test in Postman:
+  Use Collection Runner with 25 iterations
+  First 20 succeed, remaining 5 get 429 error
+
+
+VULNERABILITY 4: Content-Type Confusion
+---------------------------------------
+What it is: Attacker sends unexpected data format to exploit parser
+
+Example attack (WE PREVENT THIS):
+  Headers: Content-Type: text/html
+  Body: <script>alert('XSS')</script>
+
+How we prevent it:
+  ✅ Validate Content-Type header
+  ✅ Reject non-JSON requests
+
+Test in Postman:
+  Method: POST
+  URL: {{BASE_URL}}/api/test-records
+  Headers: Content-Type: text/plain
+  Result: 415 Unsupported Media Type
+
+
+VULNERABILITY 5: Mass Assignment
+--------------------------------
+What it is: Attacker modifies fields they shouldn't by adding extra fields
+
+Example of vulnerable code (WE DON'T DO THIS):
+  const body = await req.json()
+  const record = await prisma.recordTest.create({
+    data: { ...body, userId }  // Attacker could set any field!
+  })
+  // If attacker sends: { "title": "Test", "isAdmin": true }
+  // They might gain admin privileges!
+
+How we prevent it:
+  ✅ We explicitly specify allowed fields
+  ✅ Code: data: { title, description, status, userId }
+  ✅ Only these fields can be set
+
+Test in Postman:
+  Method: POST
+  URL: {{BASE_URL}}/api/test-records
+  Body: {
+    "title": "Test",
+    "maliciousField": "hacked",
+    "isAdmin": true
+  }
+  Result: 201 Created, but maliciousField and isAdmin are ignored
+
+
+VULNERABILITY 6: Information Disclosure
+---------------------------------------
+What it is: Error messages reveal sensitive information
+
+Example of vulnerable code (WE DON'T DO THIS):
+  catch (error) {
+    return Response.json({ error: error.message })
+    // Might reveal database schema, file paths, etc.
+  }
+
+How we prevent it:
+  ✅ We use generic error messages
+  ✅ Code: lib/errors.ts - ApiError class
+  ✅ We log detailed errors server-side, show generic messages to client
+
+Example:
+  Database error: "Column 'userId' does not exist in table 'records'"
+  We show: "An error occurred. Please try again."
+
+
+================================================================================
+8) BEST PRACTICES & SECURITY CHECKLIST
+================================================================================
+
+✅ Authentication
+  - Use established providers (Clerk, Auth0, Firebase)
+  - Never roll your own authentication
+  - Use HTTPS in production
+  - Secure session cookies (httpOnly, secure, sameSite)
+
+✅ Authorization
+  - Always verify userId in database queries
+  - Use: where: { id, userId }
+  - Never trust client-side data
+  - Implement role-based access control (RBAC) if needed
+
+✅ Input Validation
+  - Validate data types (typeof title === 'string')
+  - Validate required fields (!title)
+  - Validate data format (email regex, URL format)
+  - Sanitize user input (trim, lowercase)
+
+✅ Rate Limiting
+  - Implement on all API endpoints
+  - Stricter limits on sensitive endpoints (login, payment)
+  - Consider user tiers (free vs paid)
+  - Monitor and adjust limits based on usage
+
+✅ Database Security
+  - Use ORM (Prisma) to prevent SQL injection
+  - Never use raw SQL with user input
+  - Use parameterized queries if raw SQL is necessary
+  - Implement database backups
+
+✅ Environment Variables
+  - Never commit .env files to git
+  - Use different keys for dev/staging/prod
+  - Rotate secrets regularly
+  - Use secret management tools (AWS Secrets Manager, Vault)
+
+✅ API Security
+  - Validate Content-Type headers
+  - Use CORS properly (restrict allowed origins)
+  - Implement CSRF protection for state-changing operations
+  - Use API versioning (/api/v1/...)
+
+✅ Error Handling
+  - Log detailed errors server-side
+  - Show generic errors to clients
+  - Never expose stack traces in production
+  - Monitor errors with tools (Sentry, LogRocket)
+
+✅ Monitoring & Logging
+  - Log authentication attempts
+  - Log rate limit violations
+  - Log suspicious activity
+  - Set up alerts for anomalies
+
+
+================================================================================
+9) POSTMAN COLLECTION SUMMARY
+================================================================================
+
+Create these requests in Postman for your tutorial:
+
+COLLECTION: "SaaS Security Testing"
+
+Folder: "1. Authentication"
+  ├─ Request: "List Records (Authenticated)"
+  │  └─ GET /api/test-records with valid token → 200 OK
+  └─ Request: "List Records (No Auth)"
+     └─ GET /api/test-records without token → 401 Unauthorized
+
+Folder: "2. Authorization"
+  ├─ Request: "Get Own Record"
+  │  └─ GET /api/test-records/:id (your record) → 200 OK
+  └─ Request: "Get Other User's Record"
+     └─ GET /api/test-records/:id (other user) → 404 Not Found
+
+Folder: "3. Content-Type Validation"
+  ├─ Request: "Valid Content-Type"
+  │  └─ POST /api/test-records with application/json → 201 Created
+  ├─ Request: "Invalid Content-Type"
+  │  └─ POST /api/test-records with text/plain → 415 Error
+  └─ Request: "Missing Content-Type"
+     └─ POST /api/test-records without header → 415 Error
+
+Folder: "4. Rate Limiting"
+  ├─ Request: "Normal Request"
+  │  └─ GET /api/test-records → 200 OK (check X-RateLimit-Remaining)
+  └─ Request: "Rate Limit Test"
+     └─ Use Collection Runner: 25 iterations → First 20 succeed, rest fail
+
+Folder: "5. Input Validation"
+  ├─ Request: "Valid Input"
+  │  └─ POST /api/test-records with valid data → 201 Created
+  ├─ Request: "Missing Required Field"
+  │  └─ POST /api/test-records without title → 400 Bad Request
+  └─ Request: "Invalid Data Type"
+     └─ POST /api/test-records with title: 123 → 400 Bad Request
+
+Folder: "6. Mass Assignment Protection"
+  └─ Request: "Extra Fields Ignored"
+     └─ POST /api/test-records with malicious fields → 201 Created (extra fields ignored)
+
+
+================================================================================
+10) TUTORIAL SCRIPT FOR VIDEO RECORDING
+================================================================================
+
+INTRO (2 minutes):
+"Welcome to this security tutorial for our SaaS application.
+Today, we'll explore the security layers protecting our API,
+and I'll show you practical examples using Postman.
+
+We'll cover:
+1. Authentication - WHO you are
+2. Authorization - WHAT you can access
+3. Rate Limiting - HOW MUCH you can do
+4. Input Validation - WHAT data is acceptable
+5. Content-Type validation - HOW data should be formatted
+
+Let's get started!"
+
+SECTION 1: Setup (5 minutes):
+- Show how to install Postman
+- Demonstrate getting authentication token from browser
+- Create first request in Postman
+- Show successful API call
+
+SECTION 2: Authentication (5 minutes):
+- Explain what authentication is (WHO are you?)
+- Show successful request with token
+- Remove token and show 401 error
+- Explain Clerk's role in our app
+
+SECTION 3: Authorization (10 minutes):
+- Explain difference between authentication and authorization
+- Show accessing your own record (success)
+- Attempt to access another user's record (fail)
+- Show the code that enforces this (where: { id, userId })
+- Explain why this matters (privacy, data security)
+
+SECTION 4: Rate Limiting (10 minutes):
+- Explain what DoS attacks are
+- Show X-RateLimit-Remaining header
+- Use Collection Runner to hit rate limit
+- Show 429 error
+- Wait 60 seconds and show reset
+- Explain LRU cache (notebook analogy)
+
+SECTION 5: Content-Type Validation (5 minutes):
+- Explain what Content-Type is
+- Show successful request with application/json
+- Show failed request with text/plain
+- Explain why this matters
+
+SECTION 6: Input Validation (5 minutes):
+- Show successful request with valid data
+- Show failed request without required field
+- Show failed request with wrong data type
+- Explain mass assignment protection
+
+SECTION 7: Real-World Scenarios (10 minutes):
+- Walk through SQL injection prevention
+- Demonstrate how Prisma protects us
+- Show potential attack attempts and how they fail
+- Discuss security best practices
+
+OUTRO (3 minutes):
+"We've covered the main security layers in our application:
+- Authentication ensures only logged-in users access the API
+- Authorization ensures users only access their own data
+- Rate limiting prevents abuse and DoS attacks
+- Input validation ensures data integrity
+- Content-Type validation prevents parser exploits
+
+Remember: Security is not a feature, it's a foundation!
+
+Additional resources:
+- OWASP Top 10: https://owasp.org/www-project-top-ten/
+- Prisma Security: https://www.prisma.io/docs/concepts/security
+- Clerk Docs: https://clerk.com/docs
+
+Thanks for watching!"
+
+
+================================================================================
+11) ADDITIONAL TOPICS FOR ADVANCED STUDENTS
+================================================================================
+
+TOPIC: HTTPS vs HTTP
+- All production APIs should use HTTPS
+- HTTPS encrypts data in transit
+- Prevents man-in-the-middle attacks
+- Test: Show how HTTP exposes data in browser DevTools
+
+TOPIC: CORS (Cross-Origin Resource Sharing)
+- Prevents unauthorized domains from accessing your API
+- Configure allowed origins in production
+- Test: Try accessing API from different domain
+
+TOPIC: JWT Tokens (JSON Web Tokens)
+- How Clerk uses JWTs for authentication
+- Token structure: header.payload.signature
+- Token expiration and refresh
+
+TOPIC: Password Security
+- Never store passwords in plain text
+- Use bcrypt or Argon2 for hashing
+- Implement password strength requirements
+- Clerk handles this for us
+
+TOPIC: Two-Factor Authentication (2FA)
+- Additional security layer beyond password
+- Clerk supports 2FA out of the box
+- Prevents account takeover even if password is compromised
+
+TOPIC: API Keys vs Session Tokens
+- API keys: Long-lived, for server-to-server
+- Session tokens: Short-lived, for user sessions
+- Never expose API keys in client-side code
+
+TOPIC: Security Headers
+- Content-Security-Policy (CSP)
+- X-Frame-Options (prevents clickjacking)
+- X-Content-Type-Options
+- Strict-Transport-Security (HSTS)
+
+TOPIC: Logging & Monitoring
+- Log all authentication attempts
+- Monitor rate limit violations
+- Set up alerts for suspicious activity
+- Tools: Sentry, LogRocket, Datadog
+
+
+================================================================================
+CONCLUSION
+================================================================================
+
+Security is built in LAYERS. If one layer fails, others provide backup.
+
+Our security layers:
+1. HTTPS (encryption in transit) ← Not covered in detail
+2. Authentication (Clerk) ← WHO are you?
+3. Authorization (userId checks) ← WHAT can you access?
+4. Rate Limiting (LRU cache) ← HOW MUCH can you do?
+5. Input Validation ← WHAT data is acceptable?
+6. Content-Type Validation ← HOW should data be formatted?
+7. SQL Injection Prevention (Prisma) ← Database security
+
+Each layer is important. Remove one, and you weaken the entire system.
+
+For your students:
+- Practice these concepts in Postman
+- Try to "break" the API (ethically!)
+- Understand WHY each security measure exists
+- Apply these principles to your own projects
+
+Security is not optional. It's essential.
+
+Questions? Check the code in:
+- app/api/test-records/route.ts (main API endpoints)
+- app/api/test-records/[id]/route.ts (single record endpoints)
+- lib/rate-limit.ts (rate limiting implementation)
+- lib/errors.ts (error handling)
+
+Happy coding, and stay secure! 🔒

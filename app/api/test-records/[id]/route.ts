@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { auth } from '@clerk/nextjs/server'
 import { prisma } from '@/lib/prisma'
 import { handleApiError, ApiError } from '@/lib/errors'
+import { apiLimiter, getRateLimitIdentifier, validateContentType } from '@/lib/rate-limit'
 
 // GET - Get single record
 export async function GET(
@@ -13,6 +14,14 @@ export async function GET(
 
     if (!userId) {
       throw new ApiError(401, 'Unauthorized')
+    }
+
+    // Rate limiting - 20 requests per minute
+    const identifier = getRateLimitIdentifier(req, userId)
+    const { success, remaining } = await apiLimiter.check(20, identifier)
+
+    if (!success) {
+      throw new ApiError(429, 'Rate limit exceeded. Please try again later.')
     }
 
     const { id } = await params
@@ -28,7 +37,10 @@ export async function GET(
       throw new ApiError(404, 'Record not found')
     }
 
-    return NextResponse.json(record, { status: 200 })
+    const response = NextResponse.json(record, { status: 200 })
+    response.headers.set('X-RateLimit-Remaining', remaining.toString())
+
+    return response
   } catch (error) {
     return handleApiError(error)
   }
@@ -44,6 +56,19 @@ export async function PUT(
 
     if (!userId) {
       throw new ApiError(401, 'Unauthorized')
+    }
+
+    // Content-Type validation
+    if (!validateContentType(req, 'application/json')) {
+      throw new ApiError(415, 'Content-Type must be application/json')
+    }
+
+    // Rate limiting - 20 requests per minute
+    const identifier = getRateLimitIdentifier(req, userId)
+    const { success, remaining } = await apiLimiter.check(20, identifier)
+
+    if (!success) {
+      throw new ApiError(429, 'Rate limit exceeded. Please try again later.')
     }
 
     const { id } = await params
@@ -68,7 +93,10 @@ export async function PUT(
       }
     })
 
-    return NextResponse.json(record, { status: 200 })
+    const response = NextResponse.json(record, { status: 200 })
+    response.headers.set('X-RateLimit-Remaining', remaining.toString())
+
+    return response
   } catch (error) {
     return handleApiError(error)
   }
@@ -86,6 +114,14 @@ export async function DELETE(
       throw new ApiError(401, 'Unauthorized')
     }
 
+    // Rate limiting - 20 requests per minute
+    const identifier = getRateLimitIdentifier(req, userId)
+    const { success, remaining } = await apiLimiter.check(20, identifier)
+
+    if (!success) {
+      throw new ApiError(429, 'Rate limit exceeded. Please try again later.')
+    }
+
     const { id } = await params
 
     // First verify the record belongs to the user
@@ -101,7 +137,10 @@ export async function DELETE(
       where: { id }
     })
 
-    return NextResponse.json({ message: 'Record deleted successfully' }, { status: 200 })
+    const response = NextResponse.json({ message: 'Record deleted successfully' }, { status: 200 })
+    response.headers.set('X-RateLimit-Remaining', remaining.toString())
+
+    return response
   } catch (error) {
     return handleApiError(error)
   }

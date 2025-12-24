@@ -256,9 +256,6 @@ export default function CrudTest() {
                   Status
                 </th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
-                  Created
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">
                   Actions
                 </th>
               </tr>
@@ -341,9 +338,6 @@ export default function CrudTest() {
                           }`}>
                             {record.status}
                           </span>
-                        </td>
-                        <td className="px-6 py-4 text-sm text-gray-400">
-                          {new Date(record.createdAt).toLocaleDateString()}
                         </td>
                         <td className="px-6 py-4">
                           <div className="flex gap-2">

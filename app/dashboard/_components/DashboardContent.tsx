@@ -44,7 +44,7 @@ export default function DashboardContent() {
             </div>
 
             {/* CRUD Testing Section */}
-            <div className='space-y-4'>
+            <div className='space-y-4 mt-6 min-h-screen'>
                 <CrudTest />
             </div>
 
